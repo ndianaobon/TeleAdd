@@ -1,23 +1,65 @@
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, Users, Send, History, Activity, CheckCircle2, XCircle, ArrowRightLeft } from 'lucide-react';
 import { StatCard } from '../components/ui/StatCard';
 import { Card, CardBody, CardHeader } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { MigrationStatusBadge } from '../components/ui/Badge';
-import { mockAccounts, mockMigrations } from '../mock/data';
+import { LoadingBlock, ErrorBlock } from '../components/ui/Spinner';
+import { api, ApiError } from '../lib/api';
 import { formatDate, formatNumber, timeAgo } from '../lib/utils';
+import type { Migration, TelegramAccount } from '../types';
+
+const eventText = (m: Migration): string => {
+  switch (m.status) {
+    case 'completed':
+      return `Completed migration of ${formatNumber(m.successful)} members from ${m.source_chat?.title ?? 'source'}`;
+    case 'paused':
+      return `Paused migration to ${m.destination_chat?.title ?? 'destination'}`;
+    case 'running':
+    case 'queued':
+      return `Migration to ${m.destination_chat?.title ?? 'destination'} is in progress`;
+    case 'failed':
+      return `Migration to ${m.destination_chat?.title ?? 'destination'} failed`;
+    default:
+      return `Migration "${m.name}" created`;
+  }
+};
 
 export function Dashboard() {
-  const active = mockMigrations.filter((m) => m.status === 'running' || m.status === 'paused' || m.status === 'queued').length;
-  const completed = mockMigrations.filter((m) => m.status === 'completed').length;
-  const processed = mockMigrations.reduce((s, m) => s + m.processed, 0);
-  const successful = mockMigrations.reduce((s, m) => s + m.successful, 0);
-  const failed = mockMigrations.reduce((s, m) => s + m.failed, 0);
+  const [accounts, setAccounts] = useState<TelegramAccount[] | null>(null);
+  const [migrations, setMigrations] = useState<Migration[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = async () => {
+    setLoadError(null);
+    try {
+      const [accountData, migrationData] = await Promise.all([api.get<TelegramAccount[]>('/telegram-accounts'), api.get<Migration[]>('/migrations?limit=20')]);
+      setAccounts(accountData);
+      setMigrations(migrationData);
+    } catch (err) {
+      setLoadError(err instanceof ApiError ? err.message : 'Failed to load dashboard data.');
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  if (loadError) return <ErrorBlock message={loadError} onRetry={load} />;
+  if (accounts === null || migrations === null) return <LoadingBlock label="Loading dashboard…" />;
+
+  const active = migrations.filter((m) => m.status === 'running' || m.status === 'paused' || m.status === 'queued').length;
+  const completed = migrations.filter((m) => m.status === 'completed').length;
+  const processed = migrations.reduce((s, m) => s + m.processed, 0);
+  const successful = migrations.reduce((s, m) => s + m.successful, 0);
+  const failed = migrations.reduce((s, m) => s + m.failed, 0);
+  const recent = migrations.slice(0, 4);
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Connected Accounts" value={mockAccounts.length} caption={`${mockAccounts.filter((a) => a.status === 'connected').length} active`} captionTone="success" icon={<Send className="h-5 w-5" />} />
+        <StatCard label="Connected Accounts" value={accounts.length} caption={`${accounts.filter((a) => a.status === 'connected').length} active`} captionTone="success" icon={<Send className="h-5 w-5" />} />
         <StatCard label="Active Operations" value={active} caption="Processing now" captionTone="warning" icon={<Activity className="h-5 w-5" />} />
         <StatCard label="Completed Operations" value={completed} caption={`${formatNumber(processed)} members processed`} icon={<CheckCircle2 className="h-5 w-5" />} />
         <StatCard label="Successful Invitations" value={formatNumber(successful)} caption={`${formatNumber(failed)} failed / skipped`} captionTone="danger" icon={<XCircle className="h-5 w-5" />} />
@@ -34,34 +76,38 @@ export function Dashboard() {
             }
           />
           <CardBody className="overflow-x-auto pt-4">
-            <table className="w-full min-w-[560px] text-sm">
-              <thead>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-slate-400">
-                  <th className="pb-3 font-medium">Source → Destination</th>
-                  <th className="pb-3 font-medium">Members</th>
-                  <th className="pb-3 font-medium">Status</th>
-                  <th className="pb-3 font-medium">Date</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {mockMigrations.map((m) => (
-                  <tr key={m.id} className="group">
-                    <td className="py-3">
-                      <Link to={m.status === 'running' ? `/migrations/${m.id}/progress` : `/migrations/${m.id}/results`} className="font-medium hover:text-brand-600 dark:hover:text-brand-300">
-                        {m.source_chat.title} <span className="text-slate-400">→</span> {m.destination_chat.title}
-                      </Link>
-                    </td>
-                    <td className="py-3 tabular-nums text-slate-600 dark:text-slate-300">
-                      {formatNumber(m.successful)}/{formatNumber(m.total_selected)}
-                    </td>
-                    <td className="py-3">
-                      <MigrationStatusBadge status={m.status} />
-                    </td>
-                    <td className="py-3 text-slate-500">{formatDate(m.created_at)}</td>
+            {migrations.length === 0 ? (
+              <p className="py-6 text-center text-sm text-slate-500">No migrations yet.</p>
+            ) : (
+              <table className="w-full min-w-[560px] text-sm">
+                <thead>
+                  <tr className="text-left text-[11px] uppercase tracking-wider text-slate-400">
+                    <th className="pb-3 font-medium">Source → Destination</th>
+                    <th className="pb-3 font-medium">Members</th>
+                    <th className="pb-3 font-medium">Status</th>
+                    <th className="pb-3 font-medium">Date</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {migrations.map((m) => (
+                    <tr key={m.id} className="group">
+                      <td className="py-3">
+                        <Link to={m.status === 'running' || m.status === 'paused' || m.status === 'queued' ? `/migrations/${m.id}/progress` : `/migrations/${m.id}/results`} className="font-medium hover:text-brand-600 dark:hover:text-brand-300">
+                          {m.source_chat?.title ?? 'Unknown'} <span className="text-slate-400">→</span> {m.destination_chat?.title ?? 'Unknown'}
+                        </Link>
+                      </td>
+                      <td className="py-3 tabular-nums text-slate-600 dark:text-slate-300">
+                        {formatNumber(m.successful)}/{formatNumber(m.total_selected)}
+                      </td>
+                      <td className="py-3">
+                        <MigrationStatusBadge status={m.status} />
+                      </td>
+                      <td className="py-3 text-slate-500">{formatDate(m.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </CardBody>
         </Card>
 
@@ -98,20 +144,19 @@ export function Dashboard() {
           <Card>
             <CardHeader title="Recent Events" />
             <CardBody className="space-y-3 pt-3">
-              {[
-                { text: `Completed migration of ${formatNumber(mockMigrations[0].successful)} members from ${mockMigrations[0].source_chat.title}`, at: mockMigrations[0].finished_at },
-                { text: 'Discovered group Telegram News Feed (8.2k members)', at: mockMigrations[2].created_at },
-                { text: 'Paused migration to Marketing Masters by administrator request', at: mockMigrations[1].started_at },
-                { text: 'Telegram account @alex_migrator synchronised', at: mockAccounts[0].last_synced_at },
-              ].map((e, i) => (
-                <div key={i} className="flex gap-3">
-                  <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-brand-500" />
-                  <div>
-                    <p className="text-xs text-slate-700 dark:text-slate-300">{e.text}</p>
-                    <p className="text-[10px] text-slate-400">{timeAgo(e.at)}</p>
+              {recent.length === 0 ? (
+                <p className="text-xs text-slate-500">No activity yet.</p>
+              ) : (
+                recent.map((m) => (
+                  <div key={m.id} className="flex gap-3">
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-brand-500" />
+                    <div>
+                      <p className="text-xs text-slate-700 dark:text-slate-300">{eventText(m)}</p>
+                      <p className="text-[10px] text-slate-400">{timeAgo(m.finished_at ?? m.started_at ?? m.created_at)}</p>
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))
+              )}
             </CardBody>
           </Card>
         </div>

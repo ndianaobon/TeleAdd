@@ -1,24 +1,28 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Check, Search, ShieldCheck, Star, AlertTriangle, Info, X } from 'lucide-react';
+import { Check, Search, ShieldCheck, Star, AlertTriangle, Info, RefreshCw, X } from 'lucide-react';
 import { Card, CardBody } from '../../components/ui/Card';
 import { Button } from '../../components/ui/Button';
 import { Badge, EligibilityBadge } from '../../components/ui/Badge';
 import { Avatar } from '../../components/ui/Avatar';
-import { mockAccounts, mockChats, mockMembers } from '../../mock/data';
-import type { MemberEligibility, TelegramChat, TelegramMember } from '../../types';
+import { LoadingBlock, ErrorBlock, Spinner } from '../../components/ui/Spinner';
+import { api, ApiError } from '../../lib/api';
+import { useWebSocket } from '../../lib/useWebSocket';
+import type { MigrationReview, PaginatedMembers, TelegramChat, TelegramMember } from '../../types';
 import { cn, formatNumber } from '../../lib/utils';
+
+type SyncMessage = { type: 'started' } | { type: 'progress'; loaded: number } | { type: 'completed'; total: number } | { type: 'failed'; error: string };
 
 const steps = ['Source', 'Destination', 'Members', 'Review'] as const;
 
-type Filter = 'all' | MemberEligibility;
+type Filter = 'all' | 'eligible' | 'restricted' | 'already_member' | 'admins' | 'bots' | 'deleted';
 const filters: { key: Filter; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'eligible', label: 'Eligible' },
   { key: 'restricted', label: 'Restricted' },
   { key: 'already_member', label: 'Already member' },
-  { key: 'admin', label: 'Admins' },
-  { key: 'bot', label: 'Bots' },
+  { key: 'admins', label: 'Admins' },
+  { key: 'bots', label: 'Bots' },
   { key: 'deleted', label: 'Deleted' },
 ];
 
@@ -31,44 +35,114 @@ const lastSeenLabel: Record<TelegramMember['last_seen_bucket'], string> = {
   hidden: 'Hidden',
 };
 
+const PAGE_SIZE = 25;
+
 export function MigrationWizard() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [step, setStep] = useState(0);
   const [sourceId, setSourceId] = useState<string | null>(params.get('source'));
   const [destId, setDestId] = useState<string | null>(params.get('destination'));
+
+  const [chats, setChats] = useState<TelegramChat[] | null>(null);
+  const [chatsError, setChatsError] = useState<string | null>(null);
+
+  const [membersPage, setMembersPage] = useState<PaginatedMembers | null>(null);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState<string | null>(null);
+
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [rules, setRules] = useState({ excludeBots: true, excludeAdmins: true, excludeDeleted: true, excludeExisting: true, requireUsername: false });
   const [detail, setDetail] = useState<TelegramMember | null>(null);
-  const [page, setPage] = useState(0);
-  const pageSize = 25;
+  const [page, setPage] = useState(1);
 
-  const source = mockChats.find((c) => c.id === sourceId) ?? null;
-  const dest = mockChats.find((c) => c.id === destId) ?? null;
+  const [review, setReview] = useState<MigrationReview | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return mockMembers.filter((m) => {
-      if (filter !== 'all' && m.eligibility !== filter) return false;
-      if (rules.excludeBots && m.is_bot) return false;
-      if (rules.excludeAdmins && m.is_admin) return false;
-      if (rules.excludeDeleted && m.is_deleted) return false;
-      if (rules.excludeExisting && m.eligibility === 'already_member') return false;
-      if (rules.requireUsername && !m.username) return false;
-      if (!q) return true;
-      return (
-        m.first_name.toLowerCase().includes(q) ||
-        (m.last_name ?? '').toLowerCase().includes(q) ||
-        (m.username ?? '').toLowerCase().includes(q) ||
-        String(m.telegram_user_id).includes(q)
-      );
-    });
-  }, [query, filter, rules]);
+  useEffect(() => {
+    api
+      .get<TelegramChat[]>('/groups')
+      .then(setChats)
+      .catch((err) => setChatsError(err instanceof ApiError ? err.message : 'Failed to load groups.'));
+  }, []);
 
-  const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
-  const pageAllSelected = pageItems.length > 0 && pageItems.every((m) => selected.has(m.id));
+  const source = chats?.find((c) => c.id === sourceId) ?? null;
+  const dest = chats?.find((c) => c.id === destId) ?? null;
+
+  // Backend requires both chats to belong to the same connected Telegram account.
+  const destinationCandidates = useMemo(() => (chats ?? []).filter((c) => !source || c.telegram_account_id === source.telegram_account_id), [chats, source]);
+
+  const loadMembers = () => {
+    if (!source) return;
+    setMembersLoading(true);
+    setMembersError(null);
+    const qs = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE), filter });
+    if (query.trim()) qs.set('q', query.trim());
+    if (dest) qs.set('destination_chat_id', dest.id);
+    api
+      .get<PaginatedMembers>(`/groups/${source.id}/members?${qs.toString()}`)
+      .then(setMembersPage)
+      .catch((err) => setMembersError(err instanceof ApiError ? err.message : 'Failed to load members.'))
+      .finally(() => setMembersLoading(false));
+  };
+
+  useEffect(() => {
+    if (step === 2) loadMembers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, source?.id, dest?.id, page, filter, query]);
+
+  const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'done' | 'error'>('idle');
+  const [syncLoaded, setSyncLoaded] = useState(0);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const startMemberSync = async () => {
+    if (!source) return;
+    setSyncError(null);
+    setSyncLoaded(0);
+    setSyncState('syncing'); // connect the socket before triggering the task so no early progress frames are missed
+    try {
+      await api.post(`/groups/${source.id}/members/sync`);
+    } catch (err) {
+      setSyncError(err instanceof ApiError ? err.message : 'Failed to start member sync.');
+      setSyncState('error');
+    }
+  };
+
+  const onSyncMessage = (msg: SyncMessage) => {
+    if (msg.type === 'started') {
+      setSyncState('syncing');
+    } else if (msg.type === 'progress') {
+      setSyncLoaded(msg.loaded);
+    } else if (msg.type === 'completed') {
+      setSyncState('done');
+      loadMembers();
+    } else if (msg.type === 'failed') {
+      setSyncState('error');
+      setSyncError('Telegram sync failed: ' + msg.error);
+    }
+  };
+
+  useWebSocket<SyncMessage>(step === 2 && source && syncState === 'syncing' ? `/ws/groups/${source.id}/sync` : null, onSyncMessage);
+
+  useEffect(() => {
+    setPage(1);
+  }, [filter, query, source?.id]);
+
+  const pageItems = membersPage?.items ?? [];
+  const applyRules = (m: TelegramMember) => {
+    if (rules.excludeBots && m.is_bot) return false;
+    if (rules.excludeAdmins && m.is_admin) return false;
+    if (rules.excludeDeleted && m.is_deleted) return false;
+    if (rules.excludeExisting && m.eligibility === 'already_member') return false;
+    if (rules.requireUsername && !m.username) return false;
+    return true;
+  };
+  const visiblePageItems = pageItems.filter(applyRules);
+  const pageAllSelected = visiblePageItems.length > 0 && visiblePageItems.every((m) => selected.has(m.id));
 
   const toggle = (id: string) =>
     setSelected((s) => {
@@ -79,24 +153,71 @@ export function MigrationWizard() {
   const togglePage = () =>
     setSelected((s) => {
       const n = new Set(s);
-      pageItems.forEach((m) => (pageAllSelected ? n.delete(m.id) : n.add(m.id)));
+      visiblePageItems.forEach((m) => (pageAllSelected ? n.delete(m.id) : n.add(m.id)));
       return n;
     });
-  const selectAll = () => setSelected(new Set(visible.map((m) => m.id)));
   const clear = () => setSelected(new Set());
 
-  const selectedMembers = mockMembers.filter((m) => selected.has(m.id));
-  const counts = {
-    restricted: selectedMembers.filter((m) => m.eligibility === 'restricted').length,
-    already: selectedMembers.filter((m) => m.eligibility === 'already_member').length,
-    eligible: selectedMembers.filter((m) => m.eligibility === 'eligible').length,
+  const [selectingAll, setSelectingAll] = useState(false);
+  const selectAll = async () => {
+    if (!source) return;
+    setSelectingAll(true);
+    try {
+      const qs = new URLSearchParams({ filter });
+      if (query.trim()) qs.set('q', query.trim());
+      if (dest) qs.set('destination_chat_id', dest.id);
+      const ids = await api.get<string[]>(`/groups/${source.id}/members/ids?${qs.toString()}`);
+      setSelected(new Set(ids));
+    } catch (err) {
+      setMembersError(err instanceof ApiError ? err.message : 'Failed to select all matching members.');
+    } finally {
+      setSelectingAll(false);
+    }
   };
 
   const canContinue = [!!source, !!dest && dest.id !== source?.id && dest.can_invite_users, selected.size > 0, true][step];
 
-  const GroupPicker = ({ value, onChange, requireInvite }: { value: string | null; onChange: (id: string) => void; requireInvite?: boolean }) => {
+  useEffect(() => {
+    if (step !== 3 || !source || !dest || selected.size === 0) return;
+    setReviewError(null);
+    setReview(null);
+    api
+      .post<MigrationReview>('/migrations/review', {
+        telegram_account_id: source.telegram_account_id,
+        source_chat_id: source.id,
+        destination_chat_id: dest.id,
+        member_ids: Array.from(selected),
+        config: { rules: { exclude_bots: rules.excludeBots, exclude_admins: rules.excludeAdmins, exclude_deleted: rules.excludeDeleted, exclude_existing_destination_members: rules.excludeExisting, require_username: rules.requireUsername } },
+      })
+      .then(setReview)
+      .catch((err) => setReviewError(err instanceof ApiError ? err.message : 'Failed to review this operation.'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
+  const startOperation = async () => {
+    if (!source || !dest) return;
+    setStarting(true);
+    setStartError(null);
+    try {
+      const migration = await api.post<{ id: string }>('/migrations', {
+        telegram_account_id: source.telegram_account_id,
+        source_chat_id: source.id,
+        destination_chat_id: dest.id,
+        member_ids: Array.from(selected),
+        config: { rules: { exclude_bots: rules.excludeBots, exclude_admins: rules.excludeAdmins, exclude_deleted: rules.excludeDeleted, exclude_existing_destination_members: rules.excludeExisting, require_username: rules.requireUsername } },
+      });
+      await api.post(`/migrations/${migration.id}/start`);
+      navigate(`/migrations/${migration.id}/progress`);
+    } catch (err) {
+      setStartError(err instanceof ApiError ? err.message : 'Failed to start the operation.');
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const GroupPicker = ({ value, onChange, requireInvite, list }: { value: string | null; onChange: (id: string) => void; requireInvite?: boolean; list: TelegramChat[] }) => {
     const [q, setQ] = useState('');
-    const list = mockChats.filter((c) => c.title.toLowerCase().includes(q.toLowerCase()));
+    const filteredList = list.filter((c) => c.title.toLowerCase().includes(q.toLowerCase()));
     const renderCard = (c: TelegramChat) => {
       const disabled = requireInvite ? !c.can_invite_users || c.id === sourceId : false;
       return (
@@ -136,10 +257,17 @@ export function MigrationWizard() {
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <input className="input pl-9" placeholder="Search groups" value={q} onChange={(e) => setQ(e.target.value)} />
         </div>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">{list.map(renderCard)}</div>
+        {filteredList.length === 0 ? (
+          <p className="text-sm text-slate-500">{requireInvite ? 'No other groups from this Telegram account can receive invitations.' : 'No groups found.'}</p>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">{filteredList.map(renderCard)}</div>
+        )}
       </div>
     );
   };
+
+  if (chatsError) return <ErrorBlock message={chatsError} />;
+  if (chats === null) return <LoadingBlock label="Loading your groups…" />;
 
   return (
     <div className="space-y-6">
@@ -170,7 +298,7 @@ export function MigrationWizard() {
               <h1 className="text-lg font-semibold">Choose your source group</h1>
               <p className="text-sm text-slate-500 dark:text-slate-400">Select the Telegram community whose members you want to work with.</p>
             </div>
-            <GroupPicker value={sourceId} onChange={setSourceId} />
+            <GroupPicker value={sourceId} onChange={setSourceId} list={chats} />
           </CardBody>
         </Card>
       )}
@@ -182,7 +310,7 @@ export function MigrationWizard() {
               <h1 className="text-lg font-semibold">Choose your destination group</h1>
               <p className="text-sm text-slate-500 dark:text-slate-400">Select the group where the selected members should be invited, subject to Telegram's permissions and restrictions.</p>
             </div>
-            <GroupPicker value={destId} onChange={setDestId} requireInvite />
+            <GroupPicker value={destId} onChange={setDestId} requireInvite list={destinationCandidates} />
           </CardBody>
         </Card>
       )}
@@ -196,23 +324,33 @@ export function MigrationWizard() {
                   <Avatar name={source.title} seed={source.id} size="sm" />
                   <div>
                     <p className="text-sm font-semibold">Source: {source.title}</p>
-                    <p className="text-xs text-slate-500">{formatNumber(source.member_count)} members loaded · ready for batch selection</p>
+                    <p className="text-xs text-slate-500">
+                      {source.members_synced_at ? `${formatNumber(source.member_count)} members loaded · ready for batch selection` : 'Members have not been synced from Telegram yet'}
+                    </p>
                   </div>
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {filters.map((f) => (
-                    <button
-                      key={f.key}
-                      onClick={() => {
-                        setFilter(f.key);
-                        setPage(0);
-                      }}
-                      className={cn('rounded-md px-2.5 py-1 text-xs font-medium', filter === f.key ? 'bg-brand-500 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300')}
-                    >
-                      {f.label}
-                    </button>
-                  ))}
+                <div className="flex items-center gap-2">
+                  {syncState === 'syncing' && (
+                    <span className="flex items-center gap-1.5 text-xs text-slate-500">
+                      <Spinner className="h-3.5 w-3.5" /> Syncing… {formatNumber(syncLoaded)} loaded
+                    </span>
+                  )}
+                  <Button variant="secondary" size="sm" loading={syncState === 'syncing'} onClick={startMemberSync}>
+                    <RefreshCw className="h-3.5 w-3.5" /> Sync members from Telegram
+                  </Button>
                 </div>
+              </CardBody>
+              {syncError && (
+                <CardBody className="pt-0">
+                  <p className="rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">{syncError}</p>
+                </CardBody>
+              )}
+              <CardBody className="flex flex-wrap gap-1 pt-0">
+                {filters.map((f) => (
+                  <button key={f.key} onClick={() => setFilter(f.key)} className={cn('rounded-md px-2.5 py-1 text-xs font-medium', filter === f.key ? 'bg-brand-500 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300')}>
+                    {f.label}
+                  </button>
+                ))}
               </CardBody>
             </Card>
 
@@ -221,26 +359,20 @@ export function MigrationWizard() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="relative w-full max-w-xs">
                     <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                    <input
-                      className="input pl-9"
-                      placeholder="Search name, username, or ID"
-                      value={query}
-                      onChange={(e) => {
-                        setQuery(e.target.value);
-                        setPage(0);
-                      }}
-                    />
+                    <input className="input pl-9" placeholder="Search name, username, or ID" value={query} onChange={(e) => setQuery(e.target.value)} />
                   </div>
                   <div className="flex items-center gap-2 text-xs">
                     <span className="font-medium text-brand-600 dark:text-brand-300">{formatNumber(selected.size)} members selected</span>
-                    <Button variant="ghost" size="sm" onClick={selectAll}>
-                      Select all ({formatNumber(visible.length)})
+                    <Button variant="ghost" size="sm" loading={selectingAll} onClick={selectAll}>
+                      Select all ({formatNumber(membersPage?.total ?? 0)})
                     </Button>
                     <Button variant="ghost" size="sm" onClick={clear} disabled={selected.size === 0}>
                       Clear
                     </Button>
                   </div>
                 </div>
+
+                {membersError && <p className="rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">{membersError}</p>}
 
                 <div className="overflow-x-auto">
                   <table className="w-full min-w-[640px] text-sm">
@@ -257,28 +389,36 @@ export function MigrationWizard() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                      {pageItems.map((m) => (
-                        <tr key={m.id} className={cn('cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50', selected.has(m.id) && 'bg-brand-50/50 dark:bg-brand-500/5')} onClick={() => setDetail(m)}>
-                          <td className="py-2.5" onClick={(e) => e.stopPropagation()}>
-                            <input type="checkbox" checked={selected.has(m.id)} onChange={() => toggle(m.id)} aria-label={`Select ${m.first_name}`} className="rounded border-slate-300" />
-                          </td>
-                          <td className="py-2.5">
-                            <div className="flex items-center gap-2.5">
-                              <Avatar name={m.first_name} lastName={m.last_name} seed={m.id} size="sm" />
-                              <span className="font-medium">
-                                {m.first_name} {m.last_name}
-                              </span>
-                            </div>
-                          </td>
-                          <td className="py-2.5 text-slate-600 dark:text-slate-300">{m.username ? `@${m.username}` : <span className="text-slate-400">—</span>}</td>
-                          <td className="py-2.5 font-mono text-xs text-slate-500">{m.telegram_user_id}</td>
-                          <td className="py-2.5 text-xs text-slate-500">{lastSeenLabel[m.last_seen_bucket]}</td>
-                          <td className="py-2.5">
-                            <EligibilityBadge eligibility={m.eligibility} />
+                      {membersLoading && (
+                        <tr>
+                          <td colSpan={6} className="py-10 text-center">
+                            <Spinner className="mx-auto h-5 w-5" />
                           </td>
                         </tr>
-                      ))}
-                      {pageItems.length === 0 && (
+                      )}
+                      {!membersLoading &&
+                        visiblePageItems.map((m) => (
+                          <tr key={m.id} className={cn('cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50', selected.has(m.id) && 'bg-brand-50/50 dark:bg-brand-500/5')} onClick={() => setDetail(m)}>
+                            <td className="py-2.5" onClick={(e) => e.stopPropagation()}>
+                              <input type="checkbox" checked={selected.has(m.id)} onChange={() => toggle(m.id)} aria-label={`Select ${m.first_name}`} className="rounded border-slate-300" />
+                            </td>
+                            <td className="py-2.5">
+                              <div className="flex items-center gap-2.5">
+                                <Avatar name={m.first_name ?? '?'} lastName={m.last_name} seed={m.id} size="sm" />
+                                <span className="font-medium">
+                                  {m.first_name} {m.last_name}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="py-2.5 text-slate-600 dark:text-slate-300">{m.username ? `@${m.username}` : <span className="text-slate-400">—</span>}</td>
+                            <td className="py-2.5 font-mono text-xs text-slate-500">{m.telegram_user_id}</td>
+                            <td className="py-2.5 text-xs text-slate-500">{lastSeenLabel[m.last_seen_bucket]}</td>
+                            <td className="py-2.5">
+                              <EligibilityBadge eligibility={m.eligibility} />
+                            </td>
+                          </tr>
+                        ))}
+                      {!membersLoading && visiblePageItems.length === 0 && (
                         <tr>
                           <td colSpan={6} className="py-10 text-center text-sm text-slate-500">
                             No members match the current filters.
@@ -291,13 +431,13 @@ export function MigrationWizard() {
 
                 <div className="flex items-center justify-between text-xs text-slate-500">
                   <span>
-                    Showing {visible.length === 0 ? 0 : page * pageSize + 1}–{Math.min((page + 1) * pageSize, visible.length)} of {formatNumber(visible.length)}
+                    Page {page} of {Math.max(1, Math.ceil((membersPage?.total ?? 0) / PAGE_SIZE))} · {formatNumber(membersPage?.total ?? 0)} total
                   </span>
                   <div className="flex gap-1">
-                    <Button variant="secondary" size="sm" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+                    <Button variant="secondary" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
                       Previous
                     </Button>
-                    <Button variant="secondary" size="sm" disabled={(page + 1) * pageSize >= visible.length} onClick={() => setPage((p) => p + 1)}>
+                    <Button variant="secondary" size="sm" disabled={page * PAGE_SIZE >= (membersPage?.total ?? 0)} onClick={() => setPage((p) => p + 1)}>
                       Next
                     </Button>
                   </div>
@@ -324,6 +464,7 @@ export function MigrationWizard() {
                     <input type="checkbox" checked={rules[key]} onChange={(e) => setRules((r) => ({ ...r, [key]: e.target.checked }))} className="rounded border-slate-300" />
                   </label>
                 ))}
+                <p className="text-[11px] text-slate-400">These rules are re-applied when the operation starts, so a superset selection is safe.</p>
               </CardBody>
             </Card>
             <Card>
@@ -345,20 +486,7 @@ export function MigrationWizard() {
                     </div>
                   </div>
                 )}
-                <dl className="space-y-1.5 text-xs">
-                  <div className="flex justify-between">
-                    <dt className="text-slate-500">Known eligible</dt>
-                    <dd className="font-medium text-emerald-600">{counts.eligible}</dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-slate-500">Telegram may reject</dt>
-                    <dd className="font-medium text-amber-600">{counts.restricted}</dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-slate-500">Estimated duration</dt>
-                    <dd className="font-medium">Depends on Telegram rate limits</dd>
-                  </div>
-                </dl>
+                <p className="text-xs text-slate-500">A full eligibility breakdown is shown on the Review step.</p>
               </CardBody>
             </Card>
           </div>
@@ -373,22 +501,32 @@ export function MigrationWizard() {
                 <h1 className="text-lg font-semibold">Review operation</h1>
                 <p className="text-sm text-slate-500 dark:text-slate-400">Confirm the details below before starting.</p>
               </div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                {[
-                  ['Source', source.title],
-                  ['Destination', dest.title],
-                  ['Telegram account', `@${mockAccounts[0]?.username ?? '—'}`],
-                  ['Selected members', formatNumber(selected.size)],
-                  ['Potentially restricted', formatNumber(counts.restricted)],
-                  ['Already in destination', formatNumber(counts.already)],
-                  ['Estimated processing', 'Depends on Telegram response / rate limits'],
-                ].map(([k, v]) => (
-                  <div key={k} className="rounded-xl border border-slate-200 p-3 dark:border-slate-800">
-                    <p className="text-[11px] text-slate-400">{k}</p>
-                    <p className="mt-0.5 text-sm font-medium">{v}</p>
-                  </div>
-                ))}
-              </div>
+
+              {reviewError && <p className="rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">{reviewError}</p>}
+              {startError && <p className="rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">{startError}</p>}
+
+              {!review && !reviewError && <LoadingBlock label="Reviewing selection…" />}
+
+              {review && (
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  {[
+                    ['Source', source.title],
+                    ['Destination', dest.title],
+                    ['Selected members', formatNumber(review.selected)],
+                    ['Known eligible', formatNumber(review.known_eligible)],
+                    ['Potentially restricted', formatNumber(review.potentially_restricted)],
+                    ['Already in destination', formatNumber(review.already_in_destination)],
+                    ['Excluded by rules', formatNumber(review.excluded_by_rules)],
+                    ['Estimated processing', 'Depends on Telegram response / rate limits'],
+                  ].map(([k, v]) => (
+                    <div key={k} className="rounded-xl border border-slate-200 p-3 dark:border-slate-800">
+                      <p className="text-[11px] text-slate-400">{k}</p>
+                      <p className="mt-0.5 text-sm font-medium">{v}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div className="flex gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
                 <AlertTriangle className="h-5 w-5 shrink-0" />
                 <p>
@@ -432,7 +570,7 @@ export function MigrationWizard() {
             Continue
           </Button>
         ) : (
-          <Button variant="success" onClick={() => navigate('/migrations/mig-2/progress')}>
+          <Button variant="success" loading={starting} disabled={!review} onClick={startOperation}>
             Start Operation
           </Button>
         )}
@@ -446,7 +584,7 @@ export function MigrationWizard() {
               <X className="h-4 w-4" />
             </button>
             <div className="flex flex-col items-center text-center">
-              <Avatar name={detail.first_name} lastName={detail.last_name} seed={detail.id} size="xl" />
+              <Avatar name={detail.first_name ?? '?'} lastName={detail.last_name} seed={detail.id} size="xl" />
               <h2 className="mt-3 text-base font-semibold">
                 {detail.first_name} {detail.last_name}
               </h2>
@@ -461,7 +599,6 @@ export function MigrationWizard() {
                 ['Account type', detail.is_bot ? 'Bot' : detail.is_premium ? 'Premium user' : 'User'],
                 ['Last seen', lastSeenLabel[detail.last_seen_bucket]],
                 ['Group role', detail.is_admin ? 'Administrator' : 'Member'],
-                ['Previous migrations', '0'],
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between border-b border-slate-100 pb-2 dark:border-slate-800">
                   <dt className="text-slate-500">{k}</dt>

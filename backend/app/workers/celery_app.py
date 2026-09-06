@@ -1,6 +1,17 @@
+import redis.connection
+import redis.utils
 from celery import Celery
 
 from app.core.config import get_settings
+
+# The Windows Redis 5.0 build used in local dev predates RESP3/HELLO (Redis 6.0+), and
+# redis-py defaults unset protocol to 3. Celery's kombu transport builds its own redis
+# connections with no way to pass protocol=2 through broker_transport_options, so this
+# patches the library default before Celery opens any connection. redis.connection
+# imported its own name binding (`from .utils import DEFAULT_RESP_VERSION`), so both
+# module attributes must be patched — patching redis.utils alone doesn't reach it.
+redis.utils.DEFAULT_RESP_VERSION = 2
+redis.connection.DEFAULT_RESP_VERSION = 2
 
 settings = get_settings()
 

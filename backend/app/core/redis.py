@@ -7,7 +7,9 @@ from app.core.config import get_settings
 
 @lru_cache
 def get_redis() -> aioredis.Redis:
-    return aioredis.from_url(get_settings().redis_url, decode_responses=True)
+    # protocol=2: the Windows Redis 5.0 build in local dev predates RESP3/HELLO (Redis 6.0+),
+    # so the client must stay on RESP2 instead of trying to negotiate up.
+    return aioredis.from_url(get_settings().redis_url, decode_responses=True, protocol=2)
 
 
 def migration_control_key(migration_id: str) -> str:
