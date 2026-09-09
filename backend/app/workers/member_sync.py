@@ -1,11 +1,11 @@
 import json
 import uuid
 
+import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.redis import get_redis
 from app.models import TelegramAccount, TelegramChat
 from app.services.telegram.member_service import telegram_member_service
 
@@ -17,9 +17,13 @@ def chat_sync_channel(chat_id: str) -> str:
 
 
 async def sync_chat_members(account_id: str, chat_id: str) -> dict:
-    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    settings = get_settings()
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    redis = get_redis()
+    # A fresh client per run, not the app-wide cached one: this runs inside its own
+    # asyncio.run() per Celery task, and an asyncio Redis client can't outlive the
+    # event loop it was opened on.
+    redis = aioredis.from_url(settings.redis_url, decode_responses=True, protocol=2)
     channel = chat_sync_channel(chat_id)
     try:
         async with Session() as db:
@@ -42,3 +46,4 @@ async def sync_chat_members(account_id: str, chat_id: str) -> dict:
         raise
     finally:
         await engine.dispose()
+        await redis.aclose()

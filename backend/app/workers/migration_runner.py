@@ -9,13 +9,14 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import redis.asyncio as aioredis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.redis import get_redis, migration_control_key, migration_events_channel
+from app.core.redis import migration_control_key, migration_events_channel
 from app.models import Migration, MigrationMember, MigrationMemberResult, MigrationStatus, TelegramAccountStatus
 from app.services.telegram.client_manager import client_manager
 from app.services.telegram.invitation_service import InviteOutcome, telegram_invitation_service
@@ -27,7 +28,10 @@ class MigrationRunner:
     def __init__(self, migration_id: str) -> None:
         self.migration_id = uuid.UUID(migration_id)
         self.settings = get_settings()
-        self.redis = get_redis()
+        # A fresh client per run, not the app-wide cached one: this runs inside its own
+        # asyncio.run() per Celery task, and an asyncio Redis client can't outlive the
+        # event loop it was opened on.
+        self.redis = aioredis.from_url(self.settings.redis_url, decode_responses=True, protocol=2)
         self.channel = migration_events_channel(migration_id)
         self.control_key = migration_control_key(migration_id)
 
@@ -98,6 +102,7 @@ class MigrationRunner:
                 return await self._run(db)
         finally:
             await engine.dispose()
+            await self.redis.aclose()
 
     async def _run(self, db: AsyncSession) -> dict:
         m = await db.scalar(select(Migration).options(selectinload(Migration.telegram_account), selectinload(Migration.destination_chat)).where(Migration.id == self.migration_id))
