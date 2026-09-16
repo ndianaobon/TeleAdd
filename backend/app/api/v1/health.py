@@ -13,7 +13,7 @@ router = APIRouter(tags=["health"])
 async def _check(coro) -> dict:
     start = time.perf_counter()
     try:
-        await asyncio.wait_for(coro, timeout=3)
+        await asyncio.wait_for(coro, timeout=8)
         return {"status": "healthy", "latency_ms": round((time.perf_counter() - start) * 1000, 1)}
     except Exception as exc:  # noqa: BLE001
         return {"status": "unhealthy", "error": type(exc).__name__}
@@ -27,7 +27,10 @@ async def _db_ping():
 async def _worker_ping() -> None:
     from app.workers.celery_app import celery_app
 
-    replies = await asyncio.to_thread(lambda: celery_app.control.ping(timeout=1.5))
+    # limit=1 makes ping return as soon as one worker replies; without it Celery
+    # waits the *full* timeout collecting replies, which on a slow dev machine
+    # (plus connection setup) overran the _check budget and read as "unhealthy".
+    replies = await asyncio.to_thread(lambda: celery_app.control.ping(timeout=3, limit=1))
     if not replies:
         raise RuntimeError("no workers responded")
 
