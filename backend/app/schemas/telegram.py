@@ -17,6 +17,10 @@ class StartTelegramAuthResponse(BaseModel):
     code_sent_via: str
 
 
+class ResendTelegramCodeRequest(BaseModel):
+    auth_id: str
+
+
 class SubmitTelegramCodeRequest(BaseModel):
     auth_id: str
     code: str = Field(min_length=3, max_length=10)

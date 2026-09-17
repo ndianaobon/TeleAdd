@@ -55,6 +55,7 @@ export function TelegramAccounts() {
     setAuthId(null);
     setCodeSentVia(null);
     setFormError(null);
+    setResendNotice(null);
   };
 
   const sendCode = async () => {
@@ -69,6 +70,26 @@ export function TelegramAccounts() {
       setFormError(err instanceof ApiError ? err.message : 'Failed to request a verification code.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const [resending, setResending] = useState(false);
+  const [resendNotice, setResendNotice] = useState<string | null>(null);
+
+  const resendCode = async () => {
+    if (!authId) return;
+    setFormError(null);
+    setResendNotice(null);
+    setResending(true);
+    try {
+      const res = await api.post<{ auth_id: string; code_sent_via: string }>('/telegram-accounts/auth/resend', { auth_id: authId });
+      setCodeSentVia(res.code_sent_via);
+      setCode(''); // the previous code's hash is now invalid — only the resent one will work
+      setResendNotice(`Telegram resent the code via ${res.code_sent_via}.`);
+    } catch (err) {
+      setFormError(err instanceof ApiError ? err.message : 'Failed to resend the code.');
+    } finally {
+      setResending(false);
     }
   };
 
@@ -227,14 +248,24 @@ export function TelegramAccounts() {
           {formError && <p className="rounded-lg bg-red-50 p-2.5 text-xs text-red-700 dark:bg-red-950/40 dark:text-red-300">{formError}</p>}
           {step === 'phone' && <Input label="Phone number (international format)" placeholder="+1 555 000 0000" autoFocus value={phone} onChange={(e) => setPhone(e.target.value)} />}
           {step === 'code' && (
-            <Input
-              label="Verification code"
-              placeholder="12345"
-              hint={codeSentVia ? `Telegram sent a code via ${codeSentVia}.` : 'Enter the code Telegram sent to your device.'}
-              autoFocus
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-            />
+            <>
+              <Input
+                label="Verification code"
+                placeholder="12345"
+                hint={codeSentVia ? `Telegram sent a code via ${codeSentVia}.` : 'Enter the code Telegram sent to your device.'}
+                autoFocus
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+              />
+              {resendNotice && <p className="text-xs text-emerald-600 dark:text-emerald-400">{resendNotice}</p>}
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Didn't get it?{' '}
+                <button type="button" onClick={resendCode} disabled={resending} className="font-medium text-brand-600 hover:underline disabled:opacity-50 dark:text-brand-300">
+                  {resending ? 'Resending…' : 'Resend code'}
+                </button>{' '}
+                — this asks Telegram to try the next delivery method (e.g. SMS instead of the app).
+              </p>
+            </>
           )}
           {step === 'password' && (
             <Input label="Two-step verification password" type="password" hint="Required because your Telegram account has 2FA enabled." autoFocus value={password} onChange={(e) => setPassword(e.target.value)} />

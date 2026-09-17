@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import errors
 from telethon.sessions import StringSession
+from telethon.tl.functions.auth import ResendCodeRequest
 
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.logging import get_logger
@@ -55,6 +56,12 @@ class TelegramAuthenticationService:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Telegram reports this phone number is banned.")
             except errors.FloodWaitError as e:
                 raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, f"Telegram asks you to wait {e.seconds} seconds before requesting another code.")
+            except errors.SendCodeUnavailableError:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Telegram has no delivery methods left to try for this number right now (app, SMS, and call have all been used). "
+                    "This usually clears after a few hours. If this number is a VOIP/virtual number, Telegram may restrict it permanently — a regular mobile number is more reliable.",
+                )
             session_string = client.session.save()
         auth_id = secrets.token_urlsafe(24)
         await self._save_pending(
@@ -63,6 +70,32 @@ class TelegramAuthenticationService:
         )
         via = type(sent.type).__name__.replace("SentCodeType", "").lower() or "telegram"
         return auth_id, via
+
+    async def resend(self, user: User, auth_id: str) -> str:
+        """Asks Telegram to resend the code via ResendCodeRequest, which advances to the next
+        delivery method in Telegram's own fallback sequence (typically app -> sms -> call).
+        Telethon's `force_sms` flag was deprecated by Telegram and no longer does anything;
+        this is the mechanism real Telegram clients use for their "Resend code" button.
+        """
+        data = await self._load_pending(auth_id, user)
+        async with client_manager.ephemeral(data["session"], data["api_id"], data["api_hash"]) as client:
+            try:
+                sent = await client(ResendCodeRequest(phone_number=data["phone"], phone_code_hash=data["phone_code_hash"]))
+            except errors.PhoneCodeExpiredError:
+                await self._clear_pending(auth_id)
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "This login attempt has expired. Start again.")
+            except errors.FloodWaitError as e:
+                raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, f"Telegram asks you to wait {e.seconds} seconds before trying again.")
+            except errors.SendCodeUnavailableError:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Telegram has no more delivery methods left to try for this number right now (app, SMS, and call have all been used). "
+                    "This usually clears after a few hours. If this number is a VOIP/virtual number, Telegram may restrict it permanently — a regular mobile number is more reliable.",
+                )
+            data["phone_code_hash"] = sent.phone_code_hash
+            data["session"] = client.session.save()
+            await self._save_pending(auth_id, data)
+        return type(sent.type).__name__.replace("SentCodeType", "").lower() or "telegram"
 
     async def submit_code(self, db: AsyncSession, user: User, auth_id: str, code: str) -> tuple[str, TelegramAccount | None]:
         data = await self._load_pending(auth_id, user)

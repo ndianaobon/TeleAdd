@@ -7,6 +7,7 @@ from app.core.deps import DB, CurrentUser
 from app.core.ratelimit import rate_limit
 from app.models import TelegramAccount
 from app.schemas.telegram import (
+    ResendTelegramCodeRequest,
     StartTelegramAuthRequest,
     StartTelegramAuthResponse,
     SubmitTelegramCodeRequest,
@@ -35,6 +36,12 @@ async def list_accounts(db: DB, user: CurrentUser):
 async def auth_start(body: StartTelegramAuthRequest, user: CurrentUser):
     auth_id, via = await telegram_auth_service.start(user, body.phone_number, body.api_id, body.api_hash)
     return StartTelegramAuthResponse(auth_id=auth_id, code_sent_via=via)
+
+
+@router.post("/auth/resend", response_model=StartTelegramAuthResponse, dependencies=[Depends(rate_limit("tg_auth_resend", 5, 600))])
+async def auth_resend(body: ResendTelegramCodeRequest, user: CurrentUser):
+    via = await telegram_auth_service.resend(user, body.auth_id)
+    return StartTelegramAuthResponse(auth_id=body.auth_id, code_sent_via=via)
 
 
 @router.post("/auth/code", response_model=TelegramAuthStepResponse, dependencies=[Depends(rate_limit("tg_auth_code", 10, 600))])
